@@ -262,6 +262,42 @@ begin;
     -- in James' experience. If this is not needed, then
     -- the schema can be simplified a good deal.
 
+    /*
+       It is expected that one or more cronjobs
+       would periodically drain a portion of this table
+       via a multi-transaction procedure:
+
+        1) find and lock a set of unlocked ready-to-be
+            sent records. Do so in a single round
+            trip via check_out_enqueued_for_transmit().
+            Then commit TX to immediately show them as 'checked out
+            and in process'.
+
+        2) As each single message is passed to transport like
+            a SMTP MTA, then update that record as having been
+            sent via 'update ... set transmitted=now() where ...'
+            and then commit the TX. This 'passing off to MTA'
+            could have upteen failure modes with potential
+            real-world consequences, so we definitely don't
+            want to have the 49th message fail transport, rolling
+            back the whole set of 50, then 10 minutes later
+            the cronjob is scheduled again, mail bombing the
+            first 48 over and over and over 'cause we did not
+            incrementally and durably update the record with
+            its real-world transmission fact.
+
+            Alas, here's a perfect case for two-phase commit,
+            'cause you can't unsend an email if we then have
+            trouble updating the database-side record to record
+            it as having been sent.
+
+            If a message failed sending, then transcribe the
+            error in failure_message then move on. Let the
+            admins discern what to do and possibly reenqueue
+            at a later date if there was some sort of systemic
+            error.
+    */
+
     create table message_transmission_queue
     (
 
@@ -282,6 +318,24 @@ begin;
         transmitted timestamptz
             check (transmitted >= enqueued),
 
+        -- transmitter mutual exclusion column. Prevent
+        -- gross mismanagement of transmission cronjobs
+        -- to somehow have more than one process try to
+        -- send this same record concurrently. Check
+        -- ensures that only valid state for unlocked records
+        -- is to also be not yet transmitted, but if locked
+        -- then transmitted can be either (need to allow for
+        -- 'locked prior to xmit' as well as 'locked and xmitted',
+        -- the final resting state.)
+
+        locked boolean not null default false
+            check ((not locked and transmitted is null) or locked),
+
+        -- If message failed transport, record reason here. Only
+        -- locked records should ever have a reason.
+        failure_message text
+            check ((not locked and failure_message is null) or locked),
+
         primary key (message_id, subscriber_id, vector_id),
 
         foreign key (subscriber_id, vector_id)
@@ -291,7 +345,20 @@ begin;
         foreign key (subscriber_id, vector_id, topic_id)
             references subscription (subscriber_id, vector_id, topic_id)
             on delete cascade
+
     );
+
+    -- Partial index to assist in finding those
+    -- still needing to be sent. If we leave historical
+    -- records around in this table, then we
+    -- would expect that those yet-to-be-sent
+    -- will quickly become the minority. And will
+    -- even become as such as we pass the 50%
+    -- point in draining the 1st enqueued message.
+
+    create index message_tx_not_sent_yet_idx
+        on message_transmission_queue(enqueued)
+        where transmitted is null;
 
     -- Note that the above, with the pair of 'on delete cascade'
     -- foreign keys, will preclude this table from providing
@@ -319,6 +386,9 @@ begin;
     -- Function to populate message_transmission_queue given all
     -- current subscriptions and all messages ready to be sent.
     \i notification/functions/populate_message_transmission_queue.sql
+
+    -- find-and-lock N records of this vector type ...
+    \i notification/functions/check_out_enqueued_for_transmit.sql
 
     -- general 'raise exception' fxn and trigger function ...
     \i public/functions/fail.sql
